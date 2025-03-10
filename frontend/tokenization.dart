@@ -5,7 +5,7 @@ import 'dart:convert';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  Stripe.publishableKey = 'pk_test_51...'; // Stripe Publishable Key
+  Stripe.publishableKey = 'pk_test_51R0kQrQAJX5ewLgAq5Ur1tm5L3t2DWxGpZdN4tT6WsyOUgGSYy3kM10OIt1U11BOR7WDiwmrW5aIOtvjhvazoZ9K008uCXNEIx'; // Stripe Publishable Key
   runApp(MyApp());
 }
 
