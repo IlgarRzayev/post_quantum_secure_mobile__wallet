@@ -1,42 +1,112 @@
 const express = require('express');
-const bodyParser = require('body-parser');
-const mysql = require('mysql2/promise');
 const cors = require('cors');
-
+const forge = require('node-forge');
+const mysql = require('mysql2/promise');
+const { v4: uuidv4 } = require('uuid'); // token için
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+const port = 3000;
 
-// MySQL bağlantı bilgileri
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: 'Ilgar*2023',
-  database: 'digital_wallet',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+// MySQL bağlantı konfigürasyonu
+const dbConfig = {
+    host: 'localhost',
+    user: 'root',
+    password: 'Ilgar*2023',
+    database: 'digital_wallet'
+};
+
+app.use(cors());
+app.use(express.json());
+
+// Public key endpoint'i
+app.get('/public-key', async (req, res) => {
+    try {
+        const connection = await mysql.createConnection(dbConfig);
+
+        // Son key var mı kontrol et
+        const [rows] = await connection.execute(
+            'SELECT PublicKey FROM EncryptionKeys ORDER BY Id DESC LIMIT 1'
+        );
+
+        if (rows.length > 0) {
+            await connection.end();
+            return res.send({ publicKey: rows[0].PublicKey });
+        }
+
+        // Yoksa yeni oluştur
+        const keypair = forge.pki.rsa.generateKeyPair(2048);
+        const publicPem = forge.pki.publicKeyToPem(keypair.publicKey);
+        const privatePem = forge.pki.privateKeyToPem(keypair.privateKey);
+
+        await connection.execute(
+            'INSERT INTO EncryptionKeys (PublicKey, PrivateKey) VALUES (?, ?)',
+            [publicPem, privatePem]
+        );
+
+        await connection.end();
+        res.send({ publicKey: publicPem });
+
+    } catch (err) {
+        console.error('MySQL error:', err);
+        res.status(500).send('Database error');
+    }
 });
 
-// Token kaydetme endpoint'i
-app.post('/store_token', async (req, res) => {
-  if (!req.body.data) {
-    return res.status(400).json({ success: false, message: 'Şifrelenmiş veri gerekiyor' });
-  }
+
+// Kart verisi gönderme endpoint'i
+app.post('/submit-card', async (req, res) => {
+  const { encryptedCard, encryptedKey, iv } = req.body;
 
   try {
-    const connection = await pool.getConnection();
-    await connection.query('INSERT INTO payments (token) VALUES (?)', [req.body.data]);
-    connection.release();
-    res.status(200).json({ success: true, message: 'Şifrelenmiş veri başarıyla kaydedildi' });
-  } catch (error) {
-    console.error('Veritabanı hatası:', error);
-    res.status(500).json({ success: false, message: 'Sunucu hatası' });
+      const connection = await mysql.createConnection(dbConfig);
+
+      // En son PrivateKey'i al
+      const [rows] = await connection.execute(
+          'SELECT PrivateKey FROM EncryptionKeys ORDER BY Id DESC LIMIT 1'
+      );
+
+      if (rows.length === 0) {
+          return res.status(400).send({ error: 'No encryption keys found' });
+      }
+
+      const privatePem = rows[0].PrivateKey;
+      const privateKey = forge.pki.privateKeyFromPem(privatePem);
+
+      // AES anahtarını çöz
+      const aesKey = forge.util.decode64(privateKey.decrypt(forge.util.decode64(encryptedKey)));
+
+      // Kart verisini çöz
+      const decipher = forge.cipher.createDecipher('AES-CBC', aesKey);
+      decipher.start({ iv: forge.util.decode64(iv) });
+      decipher.update(forge.util.createBuffer(forge.util.decode64(encryptedCard)));
+      decipher.finish();
+      const decrypted = decipher.output.toString();
+
+      const parsedCard = JSON.parse(decrypted);
+      const cardNumber = parsedCard.card;
+      const last4 = cardNumber.slice(-4);
+      const maskedCard = "**** **** **** " + last4;
+
+      const token = uuidv4();
+      const userId = 1; // şimdilik sabit, sonra giriş yapmış kullanıcıdan alınabilir
+
+      // Token + maskelenmiş veri ile kayıt
+      await connection.execute(
+          `INSERT INTO TokenizedCards (Token, MaskedCardData, UserId) VALUES (?, ?, 1)`,
+          [token, maskedCard, userId]
+      );
+
+      await connection.end();
+
+      console.log("Kart maskelendi, token oluşturuldu:", token);
+      res.send({ message: "Kart başarıyla çözüldü, token oluşturuldu!", token });
+
+  } catch (err) {
+      console.error('Error:', err);
+      res.status(500).send({ error: 'Server error', details: err.message });
   }
 });
 
-// Sunucuyu başlat
-const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`Sunucu http://localhost:${PORT} adresinde çalışıyor`);
+app.listen(port, () => {
+  console.log(`Server çalışıyor: http://localhost:${port}`);
 });
+
