@@ -1,72 +1,107 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_stripe/flutter_stripe.dart';
+import 'package:encrypt/encrypt.dart' as encrypt;
+import 'package:pointycastle/asymmetric/api.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  Stripe.publishableKey = 'pk_test_51R0kQrQAJX5ewLgAq5Ur1tm5L3t2DWxGpZdN4tT6WsyOUgGSYy3kM10OIt1U11BOR7WDiwmrW5aIOtvjhvazoZ9K008uCXNEIx'; // Stripe Publishable Key
-  runApp(MyApp());
+  runApp(MaterialApp(home: CardFormPage()));
 }
 
-class MyApp extends StatelessWidget {
+class CardFormPage extends StatefulWidget {
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Stripe Payment Test',
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: PaymentScreen(),
-    );
+  _CardFormPageState createState() => _CardFormPageState();
+}
+
+class _CardFormPageState extends State<CardFormPage> {
+  final _formKey = GlobalKey<FormState>();
+  String cardNumber = '';
+  String expiry = '';
+  String cvv = '';
+  String rsaPublicKey = '';
+
+  @override
+  void initState() {
+    super.initState();
+    fetchPublicKey();
   }
-}
 
-class PaymentScreen extends StatefulWidget {
-  @override
-  _PaymentScreenState createState() => _PaymentScreenState();
-}
-
-class _PaymentScreenState extends State<PaymentScreen> {
-  Map<String, dynamic>? paymentIntent;
-
-  Future<void> makePayment() async {
-    try {
-      // Backend'den payment_intent al
-      final response = await http.post(
-        Uri.parse('https://your-backend.com/create-payment-intent'), // Backend URL
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: json.encode({
-          'amount': '1000', // Ödeme miktarı (1000 = 10.00 EUR)
-          'currency': 'eur',
-        }),
-      );
-
-      paymentIntent = json.decode(response.body);
-
-      // Stripe ödeme sayfasını aç
-      await Stripe.instance.initPaymentSheet(
-        paymentSheetParameters: SetupPaymentSheetParameters(
-          paymentIntentClientSecret: paymentIntent!['client_secret'],
-          merchantDisplayName: 'Test Merchant',
-        ),
-      );
-
-      await Stripe.instance.presentPaymentSheet();
-      print('Ödeme Başarılı!');
-    } catch (e) {
-      print('Ödeme Hatası: $e');
+  Future<void> fetchPublicKey() async {
+    final response = await http.get(Uri.parse('http://localhost:3000/public-key'));
+    if (response.statusCode == 200) {
+      final jsonRes = jsonDecode(response.body);
+      setState(() {
+        rsaPublicKey = jsonRes['publicKey'];
+      });
     }
+  }
+
+  Future<void> sendEncryptedCard() async {
+    final cardJson = jsonEncode({
+      "card": cardNumber,
+      "expiry": expiry,
+      "cvv": cvv,
+    });
+
+    final key = encrypt.Key.fromSecureRandom(32);
+    final iv = encrypt.IV.fromLength(16);
+    final aesEncrypter = encrypt.Encrypter(encrypt.AES(key, mode: encrypt.AESMode.cbc));
+    final encryptedCard = aesEncrypter.encrypt(cardJson, iv: iv);
+
+    final parser = encrypt.RSAKeyParser();
+    final publicKey = parser.parse(rsaPublicKey) as RSAPublicKey;
+    final rsaEncrypter = encrypt.Encrypter(encrypt.RSA(publicKey: publicKey));
+    final encryptedKey = rsaEncrypter.encrypt(key.base64);
+
+
+    final body = jsonEncode({
+      "encryptedCard": encryptedCard.base64,
+      "encryptedKey": encryptedKey.base64,
+      "iv": iv.base64,
+    });
+
+    final response = await http.post(
+      Uri.parse('http://localhost:3000/submit-card'),
+      headers: {'Content-Type': 'application/json'},
+      body: body,
+    );
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        content: Text('Sunucu yanıtı:\n${response.body}'),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('Stripe Payment Test')),
-      body: Center(
-        child: ElevatedButton(
-          onPressed: makePayment,
-          child: Text('Pay Now'),
+      appBar: AppBar(title: Text("Kart Giriş Formu")),
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Form(
+          key: _formKey,
+          child: Column(children: [
+            TextFormField(
+              decoration: InputDecoration(labelText: "Kart Numarası"),
+              onChanged: (val) => cardNumber = val,
+            ),
+            TextFormField(
+              decoration: InputDecoration(labelText: "Son Kullanma (MM/YY)"),
+              onChanged: (val) => expiry = val,
+            ),
+            TextFormField(
+              decoration: InputDecoration(labelText: "CVV"),
+              obscureText: true,
+              onChanged: (val) => cvv = val,
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: sendEncryptedCard,
+              child: Text("Gönder"),
+            ),
+          ]),
         ),
       ),
     );
