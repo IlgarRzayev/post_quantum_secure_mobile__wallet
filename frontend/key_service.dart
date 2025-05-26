@@ -2,14 +2,22 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
 
 class KeyService {
-  final algorithm = Ed25519();
+  // Ed25519 (dijital imza) ve X25519 (anahtar değişimi) algoritmaları
+  final edAlgorithm = Ed25519();
+  final xAlgorithm = X25519();
+
   final storage = const FlutterSecureStorage();
   final keyStorageKey = 'ed25519_private_key';
 
-  late SimpleKeyPair keyPair;
-  late SimplePublicKey publicKey;
+  late SimpleKeyPair ed25519KeyPair;
+  late SimplePublicKey ed25519PublicKey;
+
+  late SimpleKeyPair x25519KeyPair;
+  late SimplePublicKey x25519ServerPublicKey;
+  late SecretKey sharedAesKey;
 
   static const List<int> _ed25519Header = [
     0x30, 0x2a,
@@ -18,47 +26,91 @@ class KeyService {
     0x03, 0x21, 0x00
   ];
 
-  Future<void> generateAndSaveKeyPair() async {
-    keyPair = await algorithm.newKeyPair();
-    final extracted = await keyPair.extract();
+  /// --- Ed25519 işlemleri ---
+
+  Future<void> generateAndSaveEd25519KeyPair() async {
+    ed25519KeyPair = await edAlgorithm.newKeyPair();
+    final extracted = await ed25519KeyPair.extract();
     final privateKeyBytes = base64Encode(extracted.bytes);
     await storage.write(key: keyStorageKey, value: privateKeyBytes);
-    publicKey = await keyPair.extractPublicKey();
+    ed25519PublicKey = await ed25519KeyPair.extractPublicKey();
   }
 
-  Future<bool> loadSavedKeyPair() async {
+  Future<bool> loadSavedEd25519KeyPair() async {
     final stored = await storage.read(key: keyStorageKey);
     if (stored == null) return false;
 
     final privateBytes = base64Decode(stored);
-    final extracted = await (await algorithm.newKeyPairFromSeed(privateBytes)).extract();
-    publicKey = extracted.publicKey;
+    final extracted = await (await edAlgorithm.newKeyPairFromSeed(privateBytes)).extract();
+    ed25519PublicKey = extracted.publicKey;
 
-    keyPair = SimpleKeyPairData(
+    ed25519KeyPair = SimpleKeyPairData(
       privateBytes,
-      publicKey: publicKey,
+      publicKey: ed25519PublicKey,
       type: KeyPairType.ed25519,
     );
 
     return true;
   }
 
-  /// Artık ham veriyi (Uint8List) imzalayan versiyon
   Future<String> signData(Uint8List rawBytes) async {
-    final signature = await algorithm.sign(
+    final signature = await edAlgorithm.sign(
       rawBytes,
-      keyPair: keyPair,
+      keyPair: ed25519KeyPair,
     );
     return base64Encode(signature.bytes);
   }
 
-  Future<String> getPublicKeyBase64() async {
-    final raw = publicKey.bytes;
+  Future<String> getEd25519PublicKeyBase64() async {
+    final raw = ed25519PublicKey.bytes;
     final fullKey = Uint8List.fromList(_ed25519Header + raw);
     return base64Encode(fullKey);
   }
 
-  Future<void> clearKey() async {
+  Future<void> clearEd25519Key() async {
     await storage.delete(key: keyStorageKey);
+  }
+
+  /// --- X25519 işlemleri (AES key üretmek için) ---
+
+  Future<SecretKey> performKeyExchangeWithServer(String serverUrl) async {
+    x25519KeyPair = await xAlgorithm.newKeyPair();
+    final clientPubKey = await x25519KeyPair.extractPublicKey();
+
+    // Client public key'i base64 ile gönder
+    final res = await http.post(
+      Uri.parse('$serverUrl/api/cards/request-aes-key'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'clientPublicKey': base64Encode(clientPubKey.bytes),
+      }),
+    );
+
+    if (res.statusCode != 200) {
+      throw Exception("Sunucu AES anahtarı gönderemedi: ${res.body}");
+    }
+
+    final json = jsonDecode(res.body);
+    final serverPubKeyBase64 = json['serverPublicKey'];
+
+    x25519ServerPublicKey = SimplePublicKey(
+      base64Decode(serverPubKeyBase64),
+      type: KeyPairType.x25519,
+    );
+
+    // Ortak sır (shared secret) üret → AES key
+    final sharedSecret = await xAlgorithm.sharedSecretKey(
+      keyPair: x25519KeyPair,
+      remotePublicKey: x25519ServerPublicKey,
+    );
+
+    // Düzeltme: Doğrudan sharedSecret'ı kullan
+    sharedAesKey = sharedSecret;
+    return sharedAesKey;
+  }
+
+  Future<String> getClientX25519PublicKeyBase64() async {
+    final pub = await x25519KeyPair.extractPublicKey();
+    return base64Encode(pub.bytes);
   }
 }
